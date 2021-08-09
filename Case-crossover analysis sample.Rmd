@@ -1,0 +1,272 @@
+---
+title: "Sex offense, revise"
+author: "Rongbin Xu"
+date: "2020/5/14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+This is a simple tutorial of time-stratified case-crossover design based on the data described in
+Xu, R., et al. (2021). "Association between ambient temperature and sex offense: A case-crossover study in seven large US cities, 2007–2017." Sustainable Cities and Society 69: 102828.
+
+
+## load parckages
+```{r}
+rm(list = ls())
+library(tidyverse)## for data processing
+library(dlnm)## for lag models
+library(survival)## for conditional logistic regression
+library(splines) ## for non-linear splines
+library(mvmeta) ## for meta-regression
+library(lubridate) ## processing dates
+```
+
+
+
+## Step 1: process data into case-crossover format
+```{r}
+## load data with each crime records
+load("Sample_data.Rdata")
+
+
+## run a funtion for tranforming record data to case-crossover data
+f_case<-function(mydata){
+mydata$patient<-1
+mydata$id<-1:nrow(mydata)
+
+##find all possible candidate
+d<-c(-21,-14,-7,7,14,21)
+mydata2<-mydata
+for (i in 1:6) {
+  da<-mydata%>%
+    mutate(date=date+d[i])%>%
+    mutate(patient=0)
+  mydata2<-bind_rows(mydata2,da)
+  rm(da)
+}
+
+## filter only controls within one month
+case_month<-mydata2%>%
+  mutate(m=month(date))%>%
+  filter(patient==1)%>%
+  group_by(id)%>%
+  summarise(m_case=m)
+
+mydata2<-mydata2%>%
+  mutate(m=month(date))%>%
+  left_join(case_month)%>%
+  filter(m==m_case)%>%
+  select(-m,-m_case)
+
+## return results
+mydata2
+}
+
+
+## Try an example using the first two rows
+f_case(crime_data[1,])%>%View()
+f_case(crime_data[123,])## try a random row
+
+
+## Make the data for case-crossover design
+my_crossover<-f_case(crime_data)
+```
+
+## Process climate data
+```{r}
+climate<-read.csv("USA_climate_data.csv")
+climate<-climate[,-1]
+
+###temperature lag
+for (i in 1:30) { ## for short-term effects, up to 30 days lag is enough
+  climate<-climate%>%
+    group_by(city)%>%
+    mutate(tmeanlag=lag(tmean,i))%>% ## tmean is the tmean_lag0, the current day temperature
+    ungroup()
+  
+  names(climate)[ncol(climate)]<-paste("tmean_lag",i,sep = "")
+  print(i)
+}
+
+
+###precipitation lag
+for (i in 1:30) {
+  climate<-climate%>%
+    group_by(city)%>%
+    mutate(preciplag=lag(precipitation,i))%>%
+    ungroup()
+  
+  names(climate)[ncol(climate)]<-paste("precipitation_lag",i,sep = "")
+  print(i)
+}
+
+
+###humidity lag
+for (i in 1:30) {
+  climate<-climate%>%
+    group_by(city)%>%
+    mutate(humidity.lag=lag(humidity,i))%>%
+    ungroup()
+  
+  names(climate)[ncol(climate)]<-paste("humidity_lag",i,sep = "")
+  print(i)
+}
+
+
+## an example of creating complete time-series data
+complete_time.series<-expand.grid(city=c("A","B","C"),
+            date=seq.Date(from = as.Date("2007-01-01"),
+                          to=as.Date("2012-12-31"),by=1)
+            )%>%
+  arrange(city,date)
+
+```
+## Link case-crossover data with climate data
+```{r}
+str(climate)
+str(my_crossover)
+
+climate$date<-as.Date(climate$date)
+mydata<-my_crossover%>%
+  left_join(climate,by=c("city","date"))
+```
+
+
+## Case-crossover design based on dlnm
+```{r}
+
+## build a cross-basis for temperature
+names(mydata)
+tem.basis <- crossbasis(mydata[,c(7,15:22)],argvar=list(fun="lin"),
+                          arglag=list(fun="ns",knots=logknots(8,nk=1)),lag=8)
+
+## note  mydata[,c(7,15:22)] we chose the columns of tmean lag0 to lag8
+
+
+## basis for humidity and precipitation
+h.basis<-crossbasis(mydata[,c(10,75:82)],argvar=list(fun="ns",df=3),
+                      arglag=list(fun="ns",knots=logknots(8,nk=1)),lag=8)
+
+p.basis<-crossbasis(mydata[,c(6,45:52)],argvar=list(fun="ns",df=3),
+                      arglag=list(fun="ns",knots=logknots(8,nk=1)),lag=8)
+
+p.basis1<-onebasis(mydata$precipitation,fun = "ns",df=3)## an example of adjusting a variable without lag using non-linear model
+
+
+## run conditional logistic model
+model<-clogit(patient~tem.basis+h.basis+p.basis+holiday+strata(id),method = "exact",data = mydata)## method="breslow"
+
+
+
+
+BIC(model)## extract BIC value, a value evaluating the model performace, the lower the bettter, this would be useful for selecting df
+
+## present model
+tem.pred <- crosspred(tem.basis,model,at=-200:320/10,by=0.1,cen=-20,bylag = 0.1) 
+### cen is the reference temperture, can be self-defined
+### at=-20:32 is a self-defined temperature range, here I used -200:320/10, so it can allow temperature at 0.1 degree units
+
+plot(tem.pred,xlab="Temperature",ylab="Lag (days)",zlab="Odds ratio")## 3D plot
+plot(tem.pred,"overall",ylab="Odds ratio",xlab="Temperature",col="red")## overall cumulative associations for all lags
+plot(tem.pred,var = 15,exp=T,ylab="Odds ratio",xlab="Lag (days)",col="red")## lag pattern for 15 vs 10
+plot(tem.pred,lag = 1,exp=T,ylab="Odds ratio",xlab="Temperature",col="red")## effect for lag=1
+```
+## Extract effect estimates
+```{r}
+ ## try use "tem.pred$" this to explor the structure of tem.pred
+
+tem.pred$allRRfit## cumulative RR or OR, the RR at 10(the cen value defined above) is 1, other RRs are RRs relative to this temperature
+tem.pred$allRRlow## low bound of 95%CI for the cumulative RR
+tem.pred$allRRhigh ## upbound of the 95%CI for the cumulative RR
+
+tem.pred$allfit## Cumulative Beta, exp(tem.pred$allfit)=tem.pred$allRRfit
+exp(tem.pred$allfit)-tem.pred$allRRfit ## should equal to 0
+tem.pred$allse ## cumulative stardard error(SE), Beta and SE is useful to get the P-value
+
+
+## Extract effect estimates for every 5 degree increase, i.e., the estimates at 15 degree relative to 10 degrees
+tem.pred$allRRfit[36]
+tem.pred$allRRlow[36]
+tem.pred$allRRhigh[36]
+
+Beta<-tem.pred$allfit[36]  
+Se<-tem.pred$allse[36]  
+
+## Beta and Se can be used to calculate P-values
+P.value<-(1-pnorm(abs(Beta/Se),0,1))*2 
+
+```
+## build a function for case-crossover analyses
+```{r}
+f_model<-function(da){
+  tem.basis <- crossbasis(da[,c(7,15:22)],argvar=list(fun="lin"),
+                          arglag=list(fun="ns",knots=logknots(8,nk=1)),lag=8)
+
+## note  mydata[,c(7,15:22)] we chose the columns of tmean lag0 to lag8
+
+
+## basis for humidity and precipitation
+h.basis<-crossbasis(da[,c(10,75:82)],argvar=list(fun="ns",df=3),
+                      arglag=list(fun="ns",knots=logknots(8,nk=1)),lag=8)
+
+p.basis<-crossbasis(da[,c(6,45:52)],argvar=list(fun="ns",df=3),
+                      arglag=list(fun="ns",knots=logknots(8,nk=1)),lag=8)
+
+
+## run conditional logistic model
+model<-clogit(patient~tem.basis+h.basis+p.basis+holiday+strata(id),method = "exact",data = da)## method="breslow"
+
+## present model
+tem.pred <- crosspred(tem.basis,model,at=-20:32,by=0.1,cen=10,bylag = 0.1) 
+tem.pred
+}
+
+## a loop for extracting effect estimates
+result<-data.frame(city=unique(mydata$city),Beta=NA,Se=NA,P.value=NA,RR=NA,RR.low=NA,RR.up=NA)
+
+for (i in 1:7) {
+  ## extract data for a specific city
+  data<-mydata%>%filter(city==result$city[i])
+  
+  ## run model for this city
+  m<-f_model(data)
+  
+  ## save results
+  result[i,2]<-m$allfit[36]
+  result[i,3]<-m$allse[36]
+  result[i,5]<-m$allRRfit[36]
+  result[i,6]<-m$allRRlow[36]
+  result[i,7]<-m$allRRhigh[36]
+  
+  ## monitoring progress
+  print(i)
+
+}
+
+## calculate P-value
+result<-result%>%
+  mutate(P.value=(1-pnorm(abs(Beta/Se),0,1))*2 )
+
+```
+
+## Meta regression
+```{r}
+str(result$city)
+result$city<-as.factor(result$city)
+levels(result$city)
+result$city<-factor(result$city,levels = result$city)
+
+meta_model<-mvmeta(Beta~city,S=Se^2,data = result,method = "ml")## also can try method="reml"
+summary(meta_model)
+summary(meta_model)$coefficients
+
+
+## save P-value for difference
+result$P.diff[2:7]<-summary(meta_model)$coefficients[2:7,4]
+
+## save results
+write.csv(result,"city_specific_estimates.csv")
+```
+
